@@ -1,1 +1,0 @@
-ALTER TABLE "user" ALTER COLUMN "sessions" SET DATA TYPE integer[];
