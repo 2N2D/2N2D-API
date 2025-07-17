@@ -8,3 +8,5 @@ asyncio
 fastapi
 supabase
 python
+neat
+sklearn
