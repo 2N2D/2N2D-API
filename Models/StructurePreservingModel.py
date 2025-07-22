@@ -1,6 +1,6 @@
 import torch.nn as nn
 import logging
-import UniversalArchitectureModel
+from Models.UniversalArchitectureModel import UniversalArchitectureModel
 
 class StructurePreservingModel(nn.Module):
     def __init__(self, model_type, input_size, hidden_size, num_layers, output_size, 

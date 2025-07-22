@@ -1,5 +1,5 @@
 import logging
-import UniversalArchitectureModel
+from Models.UniversalArchitectureModel import UniversalArchitectureModel
 import torch.nn as nn
 import neat
 

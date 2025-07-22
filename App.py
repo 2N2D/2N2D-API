@@ -1,5 +1,5 @@
 # Run with:
-# uvicorn --app-dir . TwoN2DEndPoint:app --reload --log-level debug
+# uvicorn --app-dir . App:app --reload --log-level debug
 
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import StreamingResponse
@@ -55,7 +55,7 @@ def root():
 
 @app.post("/upload-model")
 async def upload_model(request: FilePathRequest, session_id: str = Header(...)):
-    binary_data = await getFileBinaryData(request.filepath, "onnx")
+    binary_data = await getFileBinaryData(request.filepath)
     result = load_onnx_model(binary_data)
 
     return JSONResponse(content=result)
@@ -63,7 +63,7 @@ async def upload_model(request: FilePathRequest, session_id: str = Header(...)):
 
 @app.post("/upload-csv")
 async def upload_csv(request: FilePathRequest, session_id: str = Header(...)):
-    binary_data = await getFileBinaryData(request.filepath, "csv")
+    binary_data = await getFileBinaryData(request.filepath)
     result = load_csv_data(binary_data, os.path.basename(request.filepath))
     return JSONResponse(content=result)
 
@@ -93,7 +93,7 @@ async def optimize(request: dict, session_id: str = Header(...)):
         "status": "Downloading csv data from database...",
         "progress": 3
     })
-    csv_binary = await getFileBinaryData(csv_path, "csv")
+    csv_binary = await getFileBinaryData(csv_path)
     encodedDf = None
     encoding_metadata = None
     df = pd.read_csv(io.BytesIO(csv_binary))
@@ -118,7 +118,7 @@ async def optimize(request: dict, session_id: str = Header(...)):
         "status": "Downloading onnx data from database...",
         "progress": 10
     })
-    onnx_binary = await getFileBinaryData(onnx_path, "onnx")
+    onnx_binary = await getFileBinaryData(onnx_path)
 
     def status_callback(message):
         message_queues[session_id].append(message)
@@ -143,8 +143,8 @@ async def optimize(request: dict, session_id: str = Header(...)):
         return JSONResponse(content=result, status_code=400)
 
     filename = os.path.basename(result["model_path"])
-    await uploadFile(result["model_path"], f"{session_id}/{sessionId}/{filename}")
-    result["url"] = f"{session_id}/{sessionId}/{filename}"
+    await uploadFile(result["model_path"], f"{session_id}/optim")
+    result["url"] = f"{session_id}/optim/{filename}"
 
     return JSONResponse(content=result)
 

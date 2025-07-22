@@ -16,7 +16,7 @@ from sklearn.metrics import r2_score, mean_squared_error
 from Other.Data import (analyze_csv_data)
 from Other.FileHandler import (createTempFile)
 
-from Models import (StructurePreservingModel)
+from Models.StructurePreservingModel import StructurePreservingModel
 from Other.Utils import (get_device, make_json_serializable, create_neat_config)
 from Optimize.Genetic import (optimize_with_genetic_deap)
 from Optimize.Neat import (optimize_with_neat)

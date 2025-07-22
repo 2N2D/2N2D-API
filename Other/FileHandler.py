@@ -1,4 +1,5 @@
 import boto3
+from botocore.client import Config
 import tempfile
 import requests
 from dotenv import load_dotenv
@@ -9,7 +10,8 @@ load_dotenv()
 def getS3Client():
   return boto3.client('s3', endpoint_url=os.getenv('R2_BUCKET_ENDPOINT'), 
                       aws_access_key_id=os.getenv('R2_ACCESS_KEY_ID'), 
-                      aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY'))
+                      aws_secret_access_key=os.getenv('R2_SECRET_ACCESS_KEY'),
+                              config=Config(signature_version='s3v4'))
 
 def createTempFile(fileBytes, extension):
   with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as temp_file:
@@ -23,7 +25,7 @@ def get_public_url(bucket: str, key: str) -> str:
     endpoint = os.getenv('R2_BUCKET_ENDPOINT')
     return f"{endpoint}/{bucket}/{key}"
 
-def uploadFile(filePath: str, storagePath: str, bucketName: str = "2n2d") -> str | None:
+async def uploadFile(filePath: str, storagePath: str, bucketName: str = "2n2d") -> str | None:
     s3Client = getS3Client()
     key = f"{storagePath}/{os.path.basename(filePath)}"
     try:
@@ -43,7 +45,7 @@ def uploadFile(filePath: str, storagePath: str, bucketName: str = "2n2d") -> str
     except Exception:
         return None
     
-def getFileBinaryData(path: str, bucket: str) -> bytes | None:
+async def getFileBinaryData(path: str, bucket: str = "2n2d") -> bytes | None:
     s3Client = getS3Client()
     try:
         presigned_url = s3Client.generate_presigned_url(

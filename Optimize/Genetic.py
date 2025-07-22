@@ -3,7 +3,7 @@ import torch
 import torch.optim as optim
 import torch.nn as nn
 import numpy as np
-from Models import UniversalArchitectureModel
+from Models.UniversalArchitectureModel import UniversalArchitectureModel
 import random
 
 try:

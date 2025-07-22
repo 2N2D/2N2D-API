@@ -1,7 +1,7 @@
 import logging
 import neat
 import torch.nn as nn
-from Models import NEATPytorchModel
+from Models.NEATPytorchModel import NEATPytorchModel
 import torch.optim as optim
 import torch
 
