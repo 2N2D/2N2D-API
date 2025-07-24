@@ -1,10 +1,6 @@
-# Run with:
-# uvicorn --app-dir . App:app --reload --log-level debug
-
-from fastapi import FastAPI, Request, Header
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Request, Header, HTTPException, Depends
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 import asyncio
 import pandas as pd
 import json
@@ -12,6 +8,8 @@ from pydantic import BaseModel
 import os
 import concurrent.futures
 import io
+from dotenv import load_dotenv
+import hashlib
 
 from TwoN2D import (
     load_onnx_model,
@@ -27,12 +25,23 @@ from Other.FileHandler import (
 
 from Other.Data import (encode_data_for_ml, map_original_to_encoded_columns)
 
+load_dotenv()
+API_KEY_HASH = os.getenv("API_KEY_HASH")
 
 class FilePathRequest(BaseModel):
     filepath: str
 
-
-app = FastAPI()
+app = FastAPI(
+    title="2N2D API",
+    description="API for uploading models, CSVs, optimizing ONNX models, and tracking optimization status.",
+    version="1.0.0",
+    contact={
+        "name": "2N2D Team",
+        "email": "support@2n2d.com"
+    },
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
 # Allow requests from your frontend (adjust if deploying)
 app.add_middleware(
@@ -45,33 +54,48 @@ app.add_middleware(
 
 message_queues = {}
 
+def verify_api_key(x_api_key: str = Header(..., description="Your API key")):
+    """
+    Verifies the provided API key against the stored hash.
+    """
+    if not API_KEY_HASH:
+        raise HTTPException(status_code=500, detail="API key hash not configured.")
+    if x_api_key != API_KEY_HASH:
+        raise HTTPException(status_code=401, detail="Invalid API key.")
 
-@app.get("/")
+@app.get("/", tags=["General"], summary="Root endpoint", description="Check if the API is running.")
 def root():
+    """
+    Returns a simple message to confirm the API is running.
+    """
     return {"message": "2N2D API is running"}
 
-
-# data handling
-
-@app.post("/upload-model")
-async def upload_model(request: FilePathRequest, session_id: str = Header(...)):
+@app.post("/upload-model", tags=["Data Handling"], summary="Upload ONNX Model", description="Upload an ONNX model file for processing.", dependencies=[Depends(verify_api_key)])
+async def upload_model(request: FilePathRequest, session_id: str = Header(..., description="Session identifier")):
+    """
+    Upload an ONNX model file for processing.
+    """
     binary_data = await getFileBinaryData(request.filepath)
     result = load_onnx_model(binary_data)
-
     return JSONResponse(content=result)
 
-
-@app.post("/upload-csv")
-async def upload_csv(request: FilePathRequest, session_id: str = Header(...)):
+@app.post("/upload-csv", tags=["Data Handling"], summary="Upload CSV Data", description="Upload a CSV file for processing.", dependencies=[Depends(verify_api_key)])
+async def upload_csv(request: FilePathRequest, session_id: str = Header(..., description="Session identifier")):
+    """
+    Upload a CSV file for processing.
+    """
     binary_data = await getFileBinaryData(request.filepath)
     result = load_csv_data(binary_data, os.path.basename(request.filepath))
     return JSONResponse(content=result)
 
-
-# Optimization service
-
-@app.post("/optimize")
-async def optimize(request: dict, session_id: str = Header(...)):
+@app.post("/optimize", tags=["Optimization"], summary="Optimize Model", description="Optimize an ONNX model using provided CSV data and parameters.", dependencies=[Depends(verify_api_key)])
+async def optimize(
+    request: dict,
+    session_id: str = Header(..., description="Session identifier")
+):
+    """
+    Optimize an ONNX model using provided CSV data and parameters.
+    """
     queue = message_queues.get(session_id)
     if queue is None:
         queue = []
@@ -86,8 +110,6 @@ async def optimize(request: dict, session_id: str = Header(...)):
     onnx_path = request.get("onnx_path")
     encoding = request.get("encoding")
     strat = request.get("strategy")
-
-    print(csv_path)
 
     message_queues[session_id].append({
         "status": "Downloading csv data from database...",
@@ -113,7 +135,6 @@ async def optimize(request: dict, session_id: str = Header(...)):
         "progress": 5
     })
 
-
     message_queues[session_id].append({
         "status": "Downloading onnx data from database...",
         "progress": 10
@@ -122,7 +143,6 @@ async def optimize(request: dict, session_id: str = Header(...)):
 
     def status_callback(message):
         message_queues[session_id].append(message)
-
 
     loop = asyncio.get_event_loop()
     with concurrent.futures.ThreadPoolExecutor() as pool:
@@ -148,8 +168,7 @@ async def optimize(request: dict, session_id: str = Header(...)):
 
     return JSONResponse(content=result)
 
-
-@app.get("/optimization-status/{session_id}")
+@app.get("/optimization-status/{session_id}", dependencies=[Depends(verify_api_key)])
 async def stream_status(session_id: str, request: Request):
     queue = message_queues.get(session_id)
     if queue is None:
@@ -167,13 +186,17 @@ async def stream_status(session_id: str, request: Request):
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-
-@app.get("/download-optimized")
-def download_optimized(file_path: str, session_id: str = Header(...)):
+@app.get("/download-optimized", tags=["Optimization"], summary="Download Optimized Model", description="Download the optimized ONNX model.", dependencies=[Depends(verify_api_key)])
+def download_optimized(file_path: str, session_id: str = Header(..., description="Session identifier")):
+    """
+    Download the optimized ONNX model.
+    """
     result = download_optimized_model(file_path)
     return JSONResponse(content=result)
 
-
-@app.post("/headerTest")
-def headerTest(session_id: str = Header(...)):
+@app.post("/headerTest", tags=["General"], summary="Header Test", description="Test endpoint for session_id header.", dependencies=[Depends(verify_api_key)])
+def headerTest(session_id: str = Header(..., description="Session identifier")):
+    """
+    Test endpoint for session_id header.
+    """
     return {"session_id": session_id}
