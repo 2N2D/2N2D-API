@@ -1,11 +1,12 @@
 import logging
 import neat
+import numpy as np
 import torch.nn as nn
 from Models.NEATPytorchModel import NEATPytorchModel
 import torch.optim as optim
 import torch
 
-def optimize_with_neat(X_train, y_train, input_size, output_size, config_path, base_model_info, generations=5, status_callback=None, device=None):
+def optimize_with_neat(X_train, y_train, input_size, output_size, config_path, base_model_info, generations=5, status_callback=None, device=None, is_pytorch=False):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
@@ -31,7 +32,7 @@ def optimize_with_neat(X_train, y_train, input_size, output_size, config_path, b
         
         for genome_id, genome in genomes:
             try:
-                net = NEATPytorchModel(genome, config, input_size, output_size, base_model_info)
+                net = NEATPytorchModel(genome, config, input_size, output_size, base_model_info, is_pytorch=is_pytorch)
                 net = net.to(device)  
                 optimizer = optim.Adam(net.parameters(), lr=0.001)
                 criterion = nn.MSELoss()
@@ -74,6 +75,8 @@ def optimize_with_neat(X_train, y_train, input_size, output_size, config_path, b
                 total_loss = 0
                 eval_batches = 0
                 with torch.no_grad():
+                    all_outputs = []
+                    all_targets = []
                     for i in range(0, len(X_val_eval), 32):
                         end_idx = min(i + 32, len(X_val_eval))
                         X_batch = torch.tensor(X_val_eval[i:end_idx], dtype=torch.float32, device=device)
@@ -88,19 +91,26 @@ def optimize_with_neat(X_train, y_train, input_size, output_size, config_path, b
                                 padding = torch.zeros(outputs.shape[0], padding_size, device=device)
                                 outputs = torch.cat([outputs, padding], dim=1)
                         
-                        loss = criterion(outputs, y_batch)
-                        total_loss += loss.item()
-                        eval_batches += 1
-                avg_loss = total_loss / max(eval_batches, 1)
-                genome.fitness = 1.0 / (avg_loss + 1e-5)
+                        all_outputs.append(outputs.cpu().numpy())
+                        all_targets.append(y_batch.cpu().numpy())
+                        
+                    all_outputs = np.vstack(all_outputs)
+                    all_targets = np.vstack(all_targets)
+                    
+                    from sklearn.metrics import r2_score
+                    r2 = r2_score(all_targets, all_outputs)
+                
+                # To keep NEAT selection strictly positive (roulette wheel), clip negative R2s
+                genome.fitness = max(0.0001, r2)
+                
                 if genome_id <= 5:
-                    logging.info(f"NEAT Genome {genome_id}: Val_Loss={avg_loss:.4f}, Fitness={genome.fitness:.4f}")
+                    logging.info(f"NEAT Genome {genome_id}: R2_Score={r2:.4f}, Fitness={genome.fitness:.4f}")
                 
             except Exception as e:
-                genome.fitness = 1e-6
+                genome.fitness = 0.0001
                 logging.warning(f"Error evaluating genome {genome_id}: {e}")
     winner = p.run(eval_genomes, generations)
-    winner_model = NEATPytorchModel(winner, config, input_size, output_size, base_model_info)
+    winner_model = NEATPytorchModel(winner, config, input_size, output_size, base_model_info, is_pytorch=is_pytorch)
     
     
     winner_model = winner_model.to(device)

@@ -16,10 +16,13 @@ from sklearn.metrics import r2_score, mean_squared_error
 from Other.Data import (analyze_csv_data)
 from Other.FileHandler import (createTempFile)
 
-from Models.StructurePreservingModel import StructurePreservingModel
 from Other.Utils import (get_device, make_json_serializable, create_neat_config)
 from Optimize.Genetic import (optimize_with_genetic_deap)
 from Optimize.Neat import (optimize_with_neat)
+import torch.fx as fx
+from Optimize.GraphMutator import FXMutator
+import copy
+import optuna
 
 try:
     import onnxoptimizer
@@ -740,7 +743,17 @@ def find_optimal_architecture(onnx_bytes, input_features, target_feature, df: pd
             temp_in = createTempFile(onnx_bytes, ".pt")
             model = torch.load(temp_in, map_location="cpu", weights_only=False)
             os.remove(temp_in)
-            model_info = analyze_pytorch_model(model)
+            
+            try:
+                # Replace dict-builder with native torch.fx trace
+                traced_model = fx.symbolic_trace(model)
+            except Exception as e:
+                logging.error(f"Could not symbolically trace uploaded model: {e}")
+                return {"error": "Uploaded PyTorch model contains dynamic control flow and cannot be optimized."}
+
+            model_info = FXMutator().extract_fx_blueprint(traced_model)
+            # Store native fx model
+            model_info['_native_fx_model'] = traced_model
         else:
             model_info = analyze_onnx_model(onnx_bytes)
             
@@ -786,6 +799,8 @@ def find_optimal_architecture(onnx_bytes, input_features, target_feature, df: pd
         logging.info(f"  Scaled std: {y_train.std():.6f}")
         
         
+        import copy # Ensure copy is available for baseline_model copy
+
         X_train_tensor = torch.tensor(X_train, dtype=torch.float32, device=device)
         y_train_tensor = torch.tensor(y_train, dtype=torch.float32, device=device)
         X_test_tensor = torch.tensor(X_test, dtype=torch.float32, device=device)
@@ -814,17 +829,13 @@ def find_optimal_architecture(onnx_bytes, input_features, target_feature, df: pd
         logging.info(f"Model expected input size: {input_size}, output size: {output_size}")
         logging.info(f"Using optimization strategy: {strategy}")
         send_status({"status": "Evaluating baseline performance for reference...", "progress": 10})
-        baseline_model = StructurePreservingModel(
-            model_type=model_type,
-            input_size=input_size if input_size > 0 else actual_input_size,
-            hidden_size=base_neurons,
-            num_layers=base_layers,
-            output_size=output_size if output_size > 0 else 1,
-            actual_input_size=actual_input_size,
-            actual_output_size=actual_output_size,
-            base_model_info=model_info
-        )
-        baseline_model = baseline_model.to(device)  
+        
+        if is_pytorch and '_native_fx_model' in model_info:
+            baseline_model = copy.deepcopy(model_info['_native_fx_model'])
+            baseline_model = baseline_model.to(device)
+        else:
+            raise ValueError("Only PyTorch models (.pt, .pth) are currently supported for architecture optimization.")
+
         criterion = nn.MSELoss()
         optimizer = optim.Adam(baseline_model.parameters(), lr=0.001)
         
@@ -877,188 +888,178 @@ def find_optimal_architecture(onnx_bytes, input_features, target_feature, df: pd
         results = []
 
         if strategy == 'brute-force':
-            neurons_options = [max(16, base_neurons // 2), base_neurons, base_neurons * 2]  
-            layers_options = [max(1, base_layers - 1), base_layers, base_layers + 1]       
+            send_status({"status": "Starting Optuna optimization...", "progress": 20})
 
-            current_iteration = 0
-            total_iterations = len(neurons_options) * len(layers_options)
+            def objective(trial):
+                width_factor = trial.suggest_categorical('width_factor', [0.5, 1.0, 1.5, 2.0])
+                num_layers_add = trial.suggest_int('num_layers_add', -1, 1)
 
-            for hidden_size in neurons_options:
-                for num_layers in layers_options:
-                    current_iteration += 1
-                    progress_percent = 20 + int((current_iteration / total_iterations) * 60)
+                if is_pytorch and '_native_fx_model' in model_info:
+                    base_fx = copy.deepcopy(model_info['_native_fx_model'])
+                    mutator = FXMutator()
+                    
+                    model = mutator.mutate_width(base_fx, width_factor)
+                    if num_layers_add != 0:
+                        model = mutator.mutate_depth(model, num_layers_add)
+                        
+                    hidden_size = int(base_neurons * width_factor)
+                    num_layers = max(1, base_layers + num_layers_add)
+                else:
+                    raise ValueError("Only PyTorch models (.pt, .pth) are currently supported for architecture optimization.")
 
-                    send_status({
-                        "status": f"Testing {num_layers} layers, {hidden_size} neurons",
-                        "progress": progress_percent
-                    })
-                    
-                    model = StructurePreservingModel(
-                        model_type=model_type,
-                        input_size=input_size if input_size > 0 else actual_input_size,
-                        hidden_size=hidden_size,
-                        num_layers=num_layers,
-                        output_size=output_size if output_size > 0 else 1,
-                        actual_input_size=actual_input_size,
-                        actual_output_size=actual_output_size,
-                        base_model_info=model_info 
-                    )
-                    model = model.to(device)  
-                    
-                    criterion = nn.MSELoss()
-                    if model_type == 'lstm':
-                        lr = 0.01  
-                        actual_epochs = max(max_epochs * 2, 20)
-                    elif model_type == 'conv':
-                        lr = 0.001  
-                        actual_epochs = max(max_epochs, 15)
-                    else:
-                        lr = 0.001  
-                        actual_epochs = max_epochs  
-                    
-                    optimizer = optim.Adam(model.parameters(), lr=lr)
-                    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
-                    val_split_size = int(0.2 * len(X_train_tensor))
-                    train_subset = X_train_tensor[val_split_size:]
-                    val_subset = X_train_tensor[:val_split_size]
-                    train_targets_subset = y_train_tensor[val_split_size:]
-                    val_targets_subset = y_train_tensor[:val_split_size]
-                    
-                    train_subset_dataset = TensorDataset(train_subset, train_targets_subset)
-                    train_subset_loader = DataLoader(train_subset_dataset, batch_size=batch_size, shuffle=True)
-                    
-                    val_subset_dataset = TensorDataset(val_subset, val_targets_subset)
-                    val_subset_loader = DataLoader(val_subset_dataset, batch_size=batch_size, shuffle=False)
-                    best_val_loss = float('inf')
-                    patience_counter = 0
-                    
-                    for epoch in range(actual_epochs):
-                        model.train()
-                        epoch_loss = 0
-                        batch_count = 0
+                model = model.to(device)
+                
+                criterion = nn.MSELoss()
+                if model_type == 'lstm':
+                    lr = 0.01  
+                    actual_epochs = max(max_epochs * 2, 20)
+                elif model_type == 'conv':
+                    lr = 0.001  
+                    actual_epochs = max(max_epochs, 15)
+                else:
+                    lr = 0.001  
+                    actual_epochs = max_epochs  
+                
+                optimizer = optim.Adam(model.parameters(), lr=lr)
+                scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
+                
+                val_split_size = int(0.2 * len(X_train_tensor))
+                train_subset = X_train_tensor[val_split_size:]
+                train_targets_subset = y_train_tensor[val_split_size:]
+                val_subset = X_train_tensor[:val_split_size]
+                val_targets_subset = y_train_tensor[:val_split_size]
+                
+                train_dataset = TensorDataset(train_subset, train_targets_subset)
+                val_dataset = TensorDataset(val_subset, val_targets_subset)
+                
+                train_loader_sub = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+                val_loader_sub = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+                
+                best_val_loss = float('inf')
+                patience_counter = 0
+                
+                for epoch in range(actual_epochs):
+                    model.train()
+                    for batch_X, batch_y in train_loader_sub:
+                        optimizer.zero_grad()
+                        outputs = model(batch_X)
+                        if outputs.shape != batch_y.shape:
+                            if outputs.shape[0] == batch_y.shape[0]:  
+                                if outputs.shape[1] > batch_y.shape[1]:
+                                    outputs = outputs[:, :batch_y.shape[1]]
+                                elif outputs.shape[1] < batch_y.shape[1]:
+                                    last_col = outputs[:, -1:].repeat(1, batch_y.shape[1] - outputs.shape[1])
+                                    outputs = torch.cat([outputs, last_col], dim=1)
+                        loss = criterion(outputs, batch_y)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        optimizer.step()
                         
-                        for batch_X, batch_y in train_loader:
-                            optimizer.zero_grad()
-                            outputs = model(batch_X)
-                            if outputs.shape != batch_y.shape:
-                                if outputs.shape[0] == batch_y.shape[0]:  
-                                    if outputs.shape[1] > batch_y.shape[1]:
-                                        outputs = outputs[:, :batch_y.shape[1]]
-                                    elif outputs.shape[1] < batch_y.shape[1]:
-                                        last_col = outputs[:, -1:].repeat(1, batch_y.shape[1] - outputs.shape[1])
-                                        outputs = torch.cat([outputs, last_col], dim=1)
-                            
-                            loss = criterion(outputs, batch_y)
-                            loss.backward()
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                            
-                            optimizer.step()
-                            epoch_loss += loss.item()
-                            batch_count += 1
-                        
-                        avg_epoch_loss = epoch_loss / batch_count
-                        model.eval()
-                        val_loss = 0
-                        val_batches = 0
-                        with torch.no_grad():
-                            for val_X, val_y in val_subset_loader:
-                                val_X, val_y = val_X.to(device), val_y.to(device)
-                                val_outputs = model(val_X)
-                                if val_outputs.shape != val_y.shape:
-                                    if val_outputs.shape[0] == val_y.shape[0]:  
-                                        if val_outputs.shape[1] > val_y.shape[1]:
-                                            val_outputs = val_outputs[:, :val_y.shape[1]]
-                                        elif val_outputs.shape[1] < val_y.shape[1]:
-                                            last_col = val_outputs[:, -1:].repeat(1, val_y.shape[1] - val_outputs.shape[1])
-                                            val_outputs = torch.cat([val_outputs, last_col], dim=1)
-                                
-                                val_loss += criterion(val_outputs, val_y).item()
-                                val_batches += 1
-                        
-                        avg_val_loss = val_loss / max(val_batches, 1)
-                        scheduler.step(avg_val_loss)
-                        if avg_val_loss < best_val_loss:
-                            best_val_loss = avg_val_loss
-                            patience_counter = 0
-                        else:
-                            patience_counter += 1
-                            if patience_counter >= 5:  
-                                logging.info(f"Early stopping at epoch {epoch+1} - Val loss: {avg_val_loss:.6f}")
-                                break
-                    
                     model.eval()
+                    val_loss = 0
+                    val_batches = 0
                     with torch.no_grad():
-                        all_outputs = []
-                        all_targets = []
-                        
-                        for batch_X, batch_y in test_loader:
-                            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-                            outputs = model(batch_X)
-                            if outputs.shape != batch_y.shape:
-                                if outputs.shape[0] == batch_y.shape[0]:  
-                                    if outputs.shape[1] > batch_y.shape[1]:
-                                        outputs = outputs[:, :batch_y.shape[1]]
-                                    elif outputs.shape[1] < batch_y.shape[1]:
-                                        last_col = outputs[:, -1:].repeat(1, batch_y.shape[1] - outputs.shape[1])
-                                        outputs = torch.cat([outputs, last_col], dim=1)
+                        for val_X, val_y in val_loader_sub:
+                            val_outputs = model(val_X)
+                            if val_outputs.shape != val_y.shape:
+                                if val_outputs.shape[0] == val_y.shape[0]:  
+                                    if val_outputs.shape[1] > val_y.shape[1]:
+                                        val_outputs = val_outputs[:, :val_y.shape[1]]
+                                    elif val_outputs.shape[1] < val_y.shape[1]:
+                                        last_col = val_outputs[:, -1:].repeat(1, val_y.shape[1] - val_outputs.shape[1])
+                                        val_outputs = torch.cat([val_outputs, last_col], dim=1)
+                            val_loss += criterion(val_outputs, val_y).item()
+                            val_batches += 1
                             
-                            all_outputs.append(outputs.cpu().numpy())
-                            all_targets.append(batch_y.cpu().numpy())
-                        
-                        all_outputs = np.vstack(all_outputs)
-                        all_targets = np.vstack(all_targets)
-                        if all_outputs.shape[1] != all_targets.shape[1]:
-                            if all_outputs.shape[1] > all_targets.shape[1]:
-                                all_outputs = all_outputs[:, :all_targets.shape[1]]
-                            else:
-                                all_targets = all_targets[:, :all_outputs.shape[1]]
-                        all_outputs_unscaled = scaler_y.inverse_transform(all_outputs)
-                        all_targets_unscaled = scaler_y.inverse_transform(all_targets)
-                        
-                        test_loss = mean_squared_error(all_targets_unscaled, all_outputs_unscaled)
-                        r2 = r2_score(all_targets_unscaled, all_outputs_unscaled)
-                    improvement_vs_best = (best_loss - test_loss) / best_loss * 100 if best_loss != float('inf') else 0
+                    avg_val_loss = val_loss / max(val_batches, 1)
+                    scheduler.step(avg_val_loss)
                     
-                    logging.info(f"Model {current_iteration}/{total_iterations}: "
-                               f"{num_layers}L/{hidden_size}N - "
-                               f"Loss: {test_loss:.6f}, R2: {r2:.6f}, "
-                               f"Current best: {best_loss:.6f}, "
-                               f"{'✓' if test_loss < best_loss else '✗'} "
-                               f"{improvement_vs_best:+.1f}%")
+                    if avg_val_loss < best_val_loss:
+                        best_val_loss = avg_val_loss
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+                        if patience_counter >= 5:
+                            break
+                            
+                model.eval()
+                with torch.no_grad():
+                    all_outputs = []
+                    all_targets = []
+                    for batch_X, batch_y in test_loader:
+                        outputs = model(batch_X)
+                        if outputs.shape != batch_y.shape:
+                            if outputs.shape[0] == batch_y.shape[0]:  
+                                if outputs.shape[1] > batch_y.shape[1]:
+                                    outputs = outputs[:, :batch_y.shape[1]]
+                                elif outputs.shape[1] < batch_y.shape[1]:
+                                    last_col = outputs[:, -1:].repeat(1, batch_y.shape[1] - outputs.shape[1])
+                                    outputs = torch.cat([outputs, last_col], dim=1)
+                        all_outputs.append(outputs.cpu().numpy())
+                        all_targets.append(batch_y.cpu().numpy())
+                        
+                    all_outputs = np.vstack(all_outputs)
+                    all_targets = np.vstack(all_targets)
+                    if all_outputs.shape[1] != all_targets.shape[1]:
+                        if all_outputs.shape[1] > all_targets.shape[1]:
+                            all_outputs = all_outputs[:, :all_targets.shape[1]]
+                        else:
+                            all_targets = all_targets[:, :all_outputs.shape[1]]
+                    
+                    all_outputs_unscaled = scaler_y.inverse_transform(all_outputs)
+                    all_targets_unscaled = scaler_y.inverse_transform(all_targets)
+                    
+                    test_loss = mean_squared_error(all_targets_unscaled, all_outputs_unscaled)
+                    r2 = r2_score(all_targets_unscaled, all_outputs_unscaled)
+                    
+                trial.set_user_attr('model', model)
+                trial.set_user_attr('neurons', hidden_size)
+                trial.set_user_attr('layers', num_layers)
+                trial.set_user_attr('r2_score', r2)
+                trial.set_user_attr('test_loss', test_loss)
+                
+                results.append({
+                    "neurons": int(hidden_size), 
+                    "layers": int(num_layers), 
+                    "test_loss": float(test_loss), 
+                    "r2_score": float(r2)
+                })
+                
+                return r2
 
-                    results.append({
-                        "neurons": int(hidden_size), 
-                        "layers": int(num_layers), 
-                        "test_loss": float(test_loss), 
-                        "r2_score": float(r2)
-                    })
-                    if test_loss < best_loss:
-                        best_loss = test_loss
-                        best_result = {
-                            "neurons": int(hidden_size), 
-                            "layers": int(num_layers), 
-                            "test_loss": float(test_loss), 
-                            "r2_score": float(r2)
-                        }
-                        best_model = model
-                        send_status({
-                            "status": f"New best: {num_layers}L/{hidden_size}N - Loss: {test_loss:.4f}",
-                            "progress": progress_percent
-                        })
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+            study = optuna.create_study(direction="maximize")
+            
+            n_trials = 9
+            for i in range(n_trials):
+                trial = study.ask()
+                r2_val = objective(trial)
+                study.tell(trial, r2_val)
+                
+                progress_percent = 20 + int(((i + 1) / n_trials) * 60)
+                neurons = trial.user_attrs.get('neurons', base_neurons)
+                layers = trial.user_attrs.get('layers', base_layers)
+                
+                send_status({
+                    "status": f"Trial {i+1}/{n_trials}: {layers}L/{neurons}N - R2: {r2_val:.4f}",
+                    "progress": progress_percent
+                })
+
+            best_trial = study.best_trial
+            best_r2 = best_trial.value
+            best_loss = best_trial.user_attrs['test_loss']
+            best_model = best_trial.user_attrs['model']
+            best_result = {
+                "neurons": int(best_trial.user_attrs['neurons']), 
+                "layers": int(best_trial.user_attrs['layers']), 
+                "test_loss": float(best_loss), 
+                "r2_score": float(best_r2)
+            }
 
             send_status({"status": "Optimization complete", "progress": 90})
             if best_model is None:
                 logging.warning("No models were successfully trained during optimization.")
-                best_model = StructurePreservingModel(
-                    model_type=model_type,
-                    input_size=input_size if input_size > 0 else actual_input_size,
-                    hidden_size=base_neurons,
-                    num_layers=base_layers,
-                    output_size=output_size if output_size > 0 else 1,
-                    actual_input_size=actual_input_size,
-                    actual_output_size=actual_output_size,
-                    base_model_info=model_info
-                )
+                best_model = copy.deepcopy(model_info['_native_fx_model']) if is_pytorch and '_native_fx_model' in model_info else None
                 best_result = {
                     "neurons": int(base_neurons), 
                     "layers": int(base_layers), 
@@ -1066,8 +1067,9 @@ def find_optimal_architecture(onnx_bytes, input_features, target_feature, df: pd
                     "r2_score": float(0)
                 }
                 best_loss = float('inf')
+                best_r2 = 0.0
             
-            logging.info(f"✓ Optimization complete! Best model: {best_result['layers']}L/{best_result['neurons']}N - Loss: {best_loss:.6f}")
+            logging.info(f"✓ Optimization complete! Best model: {best_result['layers']}L/{best_result['neurons']}N - R2: {best_r2:.6f}")
             send_status({
                 "status": f"Optimization complete! Best: {best_result['layers']}L/{best_result['neurons']}N",
                 "progress": 90
@@ -1079,7 +1081,7 @@ def find_optimal_architecture(onnx_bytes, input_features, target_feature, df: pd
             best_model = optimize_with_neat(
                 X_train, y_train, 
                 actual_input_size, actual_output_size,
-                config_path, model_info, max_epochs, send_status, device
+                config_path, model_info, max_epochs, send_status, device, is_pytorch=is_pytorch
             )
             send_status({"status": "Training best NEAT model with backpropagation...", "progress": 75})
             train_loader_neat = DataLoader(
@@ -1091,23 +1093,27 @@ def find_optimal_architecture(onnx_bytes, input_features, target_feature, df: pd
                 shuffle=True
             )
             
-            optimizer = optim.Adam(best_model.parameters(), lr=0.001)
-            criterion = nn.MSELoss()
-            
-            final_epochs = max_epochs*2
-            for epoch in range(final_epochs):
-                best_model.train()
-                for batch_X, batch_y in train_loader_neat:
-                    optimizer.zero_grad()
-                    outputs = best_model(batch_X)
-                    loss = criterion(outputs, batch_y)
-                    loss.backward()
-                    optimizer.step()
+            has_params = any(p.requires_grad for p in best_model.parameters())
+            if has_params:
+                optimizer = optim.Adam(best_model.parameters(), lr=0.001)
+                criterion = nn.MSELoss()
                 
-                
-                if epoch % max(1, final_epochs // 5) == 0:  
-                    progress = 75 + int((epoch / final_epochs) * 10)  
-                    send_status({"status": f"NEAT backpropagation training: epoch {epoch+1}/{final_epochs}", "progress": progress})
+                final_epochs = max_epochs*2
+                for epoch in range(final_epochs):
+                    best_model.train()
+                    for batch_X, batch_y in train_loader_neat:
+                        optimizer.zero_grad()
+                        outputs = best_model(batch_X)
+                        loss = criterion(outputs, batch_y)
+                        loss.backward()
+                        optimizer.step()
+                    
+                    
+                    if epoch % max(1, final_epochs // 5) == 0:  
+                        progress = 75 + int((epoch / final_epochs) * 10)  
+                        send_status({"status": f"NEAT backpropagation training: epoch {epoch+1}/{final_epochs}", "progress": progress})
+            else:
+                send_status({"status": "NEAT model has no trainable parameters, skipping backprop...", "progress": 85})
             
             send_status({"status": "Evaluating NEAT model performance...", "progress": 85})
             best_model = best_model.to(device)  
@@ -1144,8 +1150,7 @@ def find_optimal_architecture(onnx_bytes, input_features, target_feature, df: pd
                 "neurons": int(neurons),
                 "neat_nodes": neat_arch.get('neat_nodes', 0),
                 "neat_connections": neat_arch.get('neat_connections', 0),
-                "enhancement_factor": neat_arch.get('enhancement_factor', 1.0),
-                "base_model": model_info
+                "enhancement_factor": neat_arch.get('enhancement_factor', 1.0)
             }
             results = [{
                 "strategy": "NEAT", 
@@ -1162,7 +1167,7 @@ def find_optimal_architecture(onnx_bytes, input_features, target_feature, df: pd
             best_model, history = optimize_with_genetic_deap(
                 X_train, y_train,
                 actual_input_size, actual_output_size,
-                model_info, population_size=20, generations=max_epochs, status_callback=send_status, device=device
+                model_info, population_size=20, generations=max_epochs, status_callback=send_status, device=device, is_pytorch=is_pytorch
             )
             send_status({"status": "Final training of best genetic model...", "progress": 75})
             train_loader_genetic = DataLoader(
