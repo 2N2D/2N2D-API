@@ -13,6 +13,7 @@ import hashlib
 
 from TwoN2D import (
     load_onnx_model,
+    process_uploaded_model,
     load_csv_data,
     find_optimal_architecture,
     download_optimized_model
@@ -70,13 +71,14 @@ def root():
     """
     return {"message": "2N2D API is running"}
 
-@app.post("/upload-model", tags=["Data Handling"], summary="Upload ONNX Model", description="Upload an ONNX model file for processing.", dependencies=[Depends(verify_api_key)])
+@app.post("/upload-model", tags=["Data Handling"], summary="Upload ONNX or PyTorch Model", description="Upload an ONNX or PyTorch model file for processing.", dependencies=[Depends(verify_api_key)])
 async def upload_model(request: FilePathRequest, session_id: str = Header(..., description="Session identifier")):
     """
-    Upload an ONNX model file for processing.
+    Upload an ONNX or PyTorch model file for processing.
     """
     binary_data = await getFileBinaryData(request.filepath)
-    result = load_onnx_model(binary_data)
+    filename = os.path.basename(request.filepath)
+    result = process_uploaded_model(binary_data, filename)
     return JSONResponse(content=result)
 
 @app.post("/upload-csv", tags=["Data Handling"], summary="Upload CSV Data", description="Upload a CSV file for processing.", dependencies=[Depends(verify_api_key)])
@@ -136,10 +138,12 @@ async def optimize(
     })
 
     message_queues[session_id].append({
-        "status": "Downloading onnx data from database...",
+        "status": "Downloading model data from database...",
         "progress": 10
     })
     onnx_binary = await getFileBinaryData(onnx_path)
+    
+    is_pytorch_model = onnx_path.endswith(".pt") or onnx_path.endswith(".pth")
 
     def status_callback(message):
         message_queues[session_id].append(message)
@@ -155,7 +159,8 @@ async def optimize(
                 target_feature=mapped_target_feature,
                 status_callback=status_callback,
                 max_epochs=epochs,
-                strategy=strat
+                strategy=strat,
+                is_pytorch=is_pytorch_model
             )
         )
 

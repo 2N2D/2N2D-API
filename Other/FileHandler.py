@@ -46,6 +46,11 @@ async def uploadFile(filePath: str, storagePath: str, bucketName: str = "2n2d") 
         return None
     
 async def getFileBinaryData(path: str, bucket: str = "2n2d") -> bytes | None:
+    # For testing: if the path is a local file that exists, just read it directly
+    if os.path.exists(path) and os.path.isfile(path):
+        with open(path, "rb") as f:
+            return f.read()
+            
     s3Client = getS3Client()
     try:
         presigned_url = s3Client.generate_presigned_url(

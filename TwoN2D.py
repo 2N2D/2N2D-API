@@ -537,8 +537,177 @@ def validate_onnx_export_shapes(model, input_size, output_size, device=None):
     except Exception as e:
         return False, f"Shape validation failed: {str(e)}"
 
+def analyze_pytorch_model(model):
+    """
+    Analyzes a PyTorch model to match the dict structure of analyze_onnx_model.
+    Extracts structural info directly from PyTorch module attributes.
+    """
+    op_counts = {}
+    has_lstm = False
+    has_gru = False
+    has_rnn = False
+    has_conv = False
+    has_conv1d = False
+    has_conv2d = False
+    conv_channels = []
+    input_channels = 1
+    
+    linear_ops = 0
+    extracted_layer_sizes = []
+    max_width = 64
+    input_size = 0
+    output_size = 1
+    lstm_hidden_size = 64
+    lstm_layers = 1
+    
+    activation_types = set()
+    num_layers = 0
+
+    first_linear = True
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            op_counts['Linear'] = op_counts.get('Linear', 0) + 1
+            linear_ops += 1
+            if first_linear:
+                input_size = module.in_features
+                first_linear = False
+            extracted_layer_sizes.append(module.out_features)
+            max_width = max(max_width, module.in_features, module.out_features)
+            output_size = module.out_features
+            num_layers += 1
+            
+        elif isinstance(module, (nn.LSTM, nn.GRU, nn.RNN)):
+            op_name = module.__class__.__name__
+            op_counts[op_name] = op_counts.get(op_name, 0) + 1
+            has_lstm = has_lstm or isinstance(module, nn.LSTM)
+            has_gru = has_gru or isinstance(module, nn.GRU)
+            has_rnn = has_rnn or isinstance(module, nn.RNN)
+            lstm_hidden_size = getattr(module, 'hidden_size', 64)
+            lstm_layers = getattr(module, 'num_layers', 1)
+            if input_size == 0:
+                input_size = getattr(module, 'input_size', 64)
+            max_width = max(max_width, lstm_hidden_size)
+            num_layers += 1
+            
+        elif isinstance(module, nn.Conv1d):
+            op_counts['Conv'] = op_counts.get('Conv', 0) + 1
+            has_conv = True
+            has_conv1d = True
+            if len(conv_channels) == 0:
+                input_channels = getattr(module, 'in_channels', 1)
+            conv_channels.append(getattr(module, 'out_channels', 32))
+            num_layers += 1
+            
+        elif isinstance(module, nn.Conv2d):
+            op_counts['Conv'] = op_counts.get('Conv', 0) + 1
+            has_conv = True
+            has_conv2d = True
+            if len(conv_channels) == 0:
+                input_channels = getattr(module, 'in_channels', 1)
+            conv_channels.append(getattr(module, 'out_channels', 32))
+            num_layers += 1
+            
+        elif isinstance(module, (nn.ReLU, nn.Sigmoid, nn.Tanh, nn.LeakyReLU, nn.GELU)):
+            act_name = module.__class__.__name__.lower()
+            activation_types.add(act_name)
+            op_counts[act_name] = op_counts.get(act_name, 0) + 1
+
+    primary_activation = 'relu'
+    for act in ['gelu', 'leakyrelu', 'relu', 'tanh', 'sigmoid']:
+        if act in activation_types:
+            primary_activation = act
+            break
+
+    layer_sizes = extracted_layer_sizes[:-1] if len(extracted_layer_sizes) > 1 else [max_width]
+    
+    if num_layers == 0:
+        num_layers = 1
+        
+    architecture_info = {
+        'input_size': input_size,
+        'output_size': output_size,
+        'num_layers': num_layers,
+        'max_width': max_width,
+        'layer_sizes': layer_sizes,
+        'has_lstm': has_lstm,
+        'has_gru': has_gru,
+        'has_rnn': has_rnn,
+        'has_conv': has_conv,
+        'has_conv1d': has_conv1d,
+        'has_conv2d': has_conv2d,
+        'has_attention': False,
+        'has_normalization': False,
+        'activation_type': primary_activation,
+        'lstm_hidden_size': lstm_hidden_size,
+        'lstm_layers': lstm_layers,
+        'lstm_bidirectional': False,
+        'lstm_return_sequences': False,
+        'post_lstm_layers': linear_ops,
+        'conv_channels': conv_channels if conv_channels else [32, 64],
+        'input_channels': input_channels,
+        'post_conv_layers': linear_ops,
+        'conv_details': [],
+        'pooling_details': [],
+        'structural_ops': [],
+        'activation_ops': [],
+        'has_pooling': False,
+        'dense_layer_sizes': extracted_layer_sizes,
+        'op_counts': op_counts,
+        'op_sequence': list(op_counts.keys()),
+        'model_type': 'lstm' if (has_lstm or has_gru or has_rnn) else 'conv' if has_conv else 'feedforward',
+        'hidden_size': max_width,
+        'is_recurrent': has_lstm or has_gru or has_rnn,
+        'layers': num_layers,
+        'neurons': max_width
+    }
+    
+    return make_json_serializable(architecture_info)
+
+def process_uploaded_model(file_bytes, filename):
+    if filename.endswith(".pt") or filename.endswith(".pth"):
+        try:
+            import tempfile
+            import uuid
+            
+            temp_in = createTempFile(file_bytes, ".pt")
+            model = torch.load(temp_in, map_location="cpu", weights_only=False)
+            os.remove(temp_in)
+            
+            arch_info = analyze_pytorch_model(model)
+            in_size = arch_info.get("input_size", 10)
+            if in_size <= 0: in_size = 10
+            
+            if arch_info.get("has_conv2d"):
+                dummy_input = torch.randn(1, arch_info.get("input_channels", 1), 28, 28)
+            elif arch_info.get("has_conv1d"):
+                dummy_input = torch.randn(1, arch_info.get("input_channels", 1), in_size)
+            elif arch_info.get("has_lstm") or arch_info.get("has_gru") or arch_info.get("has_rnn"):
+                dummy_input = torch.randn(1, 10, in_size)
+            else:
+                dummy_input = torch.randn(1, in_size)
+                
+            temp_out = os.path.join(tempfile.gettempdir(), f"exported_{uuid.uuid4().hex}.onnx")
+            
+            model.eval()
+            try:
+                torch.onnx.export(model, dummy_input, temp_out, export_params=True, opset_version=12)
+                with open(temp_out, "rb") as f:
+                    onnx_bytes = f.read()
+                os.remove(temp_out)
+                return load_onnx_model(onnx_bytes)
+            except Exception as e:
+                logging.exception("Failed to export PyTorch model to ONNX for visualization")
+                return {"error": f"Failed to export PyTorch to ONNX: {str(e)}"}
+                
+        except Exception as e:
+            logging.exception("Failed to process PyTorch model")
+            return {"error": str(e)}
+    else:
+        return load_onnx_model(file_bytes)
+
 def find_optimal_architecture(onnx_bytes, input_features, target_feature, df: pd.DataFrame, max_epochs=5, 
-                            strategy='brute-force', generations=5, status_callback=None):
+                            strategy='brute-force', generations=5, status_callback=None, is_pytorch=False):
     """
     Enhanced version of the original function with new optimization strategies.
     Maintains backward compatibility while adding NEAT and DEAP genetic algorithms.
@@ -562,11 +731,19 @@ def find_optimal_architecture(onnx_bytes, input_features, target_feature, df: pd
             return {"error": "No data loaded"}
 
         if onnx_bytes is None:
-            send_status({"status": "No ONNX model loaded", "error": True})
-            return {"error": "No ONNX model loaded"}
+            send_status({"status": "No model loaded", "error": True})
+            return {"error": "No model loaded"}
 
         send_status({"status": "Analyzing model...", "progress": 5})
-        model_info = analyze_onnx_model(onnx_bytes)
+        
+        if is_pytorch:
+            temp_in = createTempFile(onnx_bytes, ".pt")
+            model = torch.load(temp_in, map_location="cpu", weights_only=False)
+            os.remove(temp_in)
+            model_info = analyze_pytorch_model(model)
+        else:
+            model_info = analyze_onnx_model(onnx_bytes)
+            
         base_layers = model_info.get('layers', 1)
         base_neurons = model_info.get('neurons', 64)
         model_type = model_info.get('model_type', 'feedforward')
