@@ -33,11 +33,14 @@ class FXMutator:
         # Deepcopy to avoid modifying the original model instance parameters
         cloned_model = copy.deepcopy(model)
         
-        try:
-            traced = fx.symbolic_trace(cloned_model)
-        except Exception as e:
-            logging.error(f"Failed to symbolically trace model for width mutation: {e}")
-            return cloned_model
+        if isinstance(cloned_model, fx.GraphModule):
+            traced = cloned_model
+        else:
+            try:
+                traced = fx.symbolic_trace(cloned_model)
+            except Exception as e:
+                logging.error(f"Failed to symbolically trace model for width mutation: {e}")
+                return cloned_model
 
         modules = dict(traced.named_modules())
         
@@ -58,10 +61,15 @@ class FXMutator:
                     # (Heuristic: if it's the last linear before output, don't scale out_features to preserve target size)
                     users = list(node.users.keys())
                     # Check if this node eventually leads to output without another Linear
-                    def reaches_output(n):
+                    def reaches_output(n, visited=None):
+                        if visited is None:
+                            visited = set()
+                        if n in visited:
+                            return False
+                        visited.add(n)
                         if n.op == 'output': return True
                         if n.op == 'call_module' and isinstance(modules.get(n.target), nn.Linear): return False
-                        return any(reaches_output(u) for u in n.users)
+                        return any(reaches_output(u, visited) for u in n.users)
                     
                     is_output_edge = any(reaches_output(u) for u in users) if users else True
                     
@@ -85,8 +93,21 @@ class FXMutator:
                         dim_overrides[node.name] = dim_overrides[node.args[0].name]
                         
             elif node.op in ('call_function', 'call_method'):
-                # Many operations preserve dimension
-                if len(node.args) > 0 and hasattr(node.args[0], 'name') and node.args[0].name in dim_overrides:
+                # Many operations preserve dimension or combine it (e.g. torch.add)
+                # Handle basic propagation for the first argument:
+                if getattr(node.target, '__name__', '') == 'cat':
+                    # Special dimensionality combining for concat
+                    # Try to infer based on inputs list if dims exist
+                    if len(node.args) > 0 and isinstance(node.args[0], (list, tuple)):
+                        sum_dim = 0
+                        has_dims = False
+                        for arg_node in node.args[0]:
+                            if hasattr(arg_node, 'name') and arg_node.name in dim_overrides:
+                                sum_dim += dim_overrides[arg_node.name]
+                                has_dims = True
+                        if has_dims:
+                            dim_overrides[node.name] = sum_dim
+                elif len(node.args) > 0 and hasattr(node.args[0], 'name') and node.args[0].name in dim_overrides:
                     dim_overrides[node.name] = dim_overrides[node.args[0].name]
         return traced
 
@@ -97,11 +118,15 @@ class FXMutator:
         (residual addition) between two compatible linear nodes.
         """
         cloned_model = copy.deepcopy(model)
-        try:
-            traced = fx.symbolic_trace(cloned_model)
-        except Exception as e:
-            logging.error(f"Failed to trace model for skip connection: {e}")
-            return cloned_model
+        
+        if isinstance(cloned_model, fx.GraphModule):
+            traced = cloned_model
+        else:
+            try:
+                traced = fx.symbolic_trace(cloned_model)
+            except Exception as e:
+                logging.error(f"Failed to trace model for skip connection: {e}")
+                return cloned_model
 
         modules = dict(traced.named_modules())
         linear_nodes = [n for n in traced.graph.nodes if n.op == 'call_module' and isinstance(modules[n.target], nn.Linear)]
@@ -126,11 +151,11 @@ class FXMutator:
                         # n_end's output + n_start's output
                         add_node = traced.graph.call_function(torch.add, (n_end, n_start))
                         
-                        # Replace all downstream uses of n_end to use add_node instead
-                        n_end.replace_all_uses_with(add_node)
-                        # Fix the self-use we broke on add_node
-                        add_node.update_arg(0, n_end)
-                        
+                        # Replace only downstream uses of n_end to use add_node instead
+                        for user in list(n_end.users):
+                            if user is not add_node:
+                                user.replace_input_with(n_end, add_node)
+                                
                     traced.recompile()
                     return traced
 
@@ -143,11 +168,15 @@ class FXMutator:
         to change the depth of the graph safely.
         """
         cloned_model = copy.deepcopy(model)
-        try:
-            traced = fx.symbolic_trace(cloned_model)
-        except Exception as e:
-            logging.error(f"Failed to symbolically trace model for depth mutation: {e}")
-            return cloned_model
+        
+        if isinstance(cloned_model, fx.GraphModule):
+            traced = cloned_model
+        else:
+            try:
+                traced = fx.symbolic_trace(cloned_model)
+            except Exception as e:
+                logging.error(f"Failed to symbolically trace model for depth mutation: {e}")
+                return cloned_model
 
         if depth_change == 0:
             return traced
@@ -173,15 +202,17 @@ class FXMutator:
             traced.add_module(new_mod_name, new_mod)
             traced.add_module(relu_mod_name, nn.ReLU())
             
+            # collect downstream users BEFORE inserting new nodes
+            original_users = list(target_node.users.keys())
+            
             with traced.graph.inserting_after(target_node):
                 new_node = traced.graph.call_module(new_mod_name, args=(target_node,))
             with traced.graph.inserting_after(new_node):
                 relu_node = traced.graph.call_module(relu_mod_name, args=(new_node,))
                 
-            # Update downstream users
-            target_node.replace_all_uses_with(relu_node)
-            # Revert the self-use we just broke
-            new_node.update_arg(0, target_node)
+            # now redirect only the original downstream users
+            for user in original_users:
+                user.replace_input_with(target_node, relu_node)
                 
         elif depth_change < 0 and len(linear_nodes) > 2:
             # Remove an intermediate linear layer
@@ -191,10 +222,19 @@ class FXMutator:
             # Find the input to this node
             input_node = node_to_remove.args[0]
             
-            # To avoid dimension mismatch, we can only safely remove it if in_features == out_features
-            # or if we are willing to rebuild the downstream node. For simplicity, patch uses:
             if mod_to_remove.in_features == mod_to_remove.out_features:
                 node_to_remove.replace_all_uses_with(input_node)
+                traced.graph.erase_node(node_to_remove)
+            else:
+                # Add a projection to reconcile dimensions instead of removing
+                proj_name = f"proj_{node_to_remove.target}"
+                traced.add_module(proj_name, nn.Linear(mod_to_remove.in_features, mod_to_remove.out_features))
+                
+                # The projection bridges the gap from input_node's size (in_features)
+                # to what downstream nodes expect (out_features)
+                with traced.graph.inserting_before(node_to_remove):
+                    proj_node = traced.graph.call_module(proj_name, args=(input_node,))
+                node_to_remove.replace_all_uses_with(proj_node)
                 traced.graph.erase_node(node_to_remove)
 
         traced.recompile()
@@ -205,10 +245,14 @@ class FXMutator:
         """
         Extracts structural JSON metadata from an FX traced model to send to the frontend/UI.
         """
-        try:
-            traced = fx.symbolic_trace(model)
-        except Exception:
-            return {"error": "Could not trace model"}
+        if isinstance(model, fx.GraphModule):
+            traced = model
+        else:
+            try:
+                traced = fx.symbolic_trace(model)
+            except Exception as e:
+                logging.warning(f"Could not trace model for blueprint: {e}")
+                return {"error": f"Could not trace model: {e}"}
             
         modules = dict(traced.named_modules())
         op_counts = {}
@@ -226,13 +270,35 @@ class FXMutator:
                         input_size = mod.in_features
                     output_size = mod.out_features
                     layer_sizes.append(mod.out_features)
-                    
+                elif isinstance(mod, (nn.LSTM, nn.GRU, nn.RNN)):
+                    if input_size is None:
+                        input_size = getattr(mod, 'input_size', 0)
+                    output_size = getattr(mod, 'hidden_size', 0)
+                    layer_sizes.append(output_size)
+                elif isinstance(mod, (nn.Conv1d, nn.Conv2d)):
+                    if input_size is None:
+                        input_size = getattr(mod, 'in_channels', 0)
+                    output_size = getattr(mod, 'out_channels', 0)
+                    layer_sizes.append(output_size)
+
+        has_rnn = any(k in op_counts for k in ['LSTM', 'GRU', 'RNN'])
+        has_conv = any(k in op_counts for k in ['Conv1d', 'Conv2d'])
+        
+        if has_rnn:
+            model_type = 'lstm'
+        elif has_conv:
+            model_type = 'conv'
+        elif 'Linear' in op_counts:
+            model_type = 'feedforward'
+        else:
+            model_type = 'custom'
+            
         return {
-            'model_type': 'feedforward' if 'Linear' in op_counts else 'custom',
-            'layers': op_counts.get('Linear', 0),
+            'model_type': model_type,
+            'layers': sum(op_counts.get(k, 0) for k in ['Linear', 'LSTM', 'GRU', 'RNN', 'Conv1d', 'Conv2d']),
             'neurons': max(layer_sizes) if layer_sizes else 0,
-            'input_size': input_size or 0,
-            'output_size': output_size or 0,
+            'input_size': int(input_size) if input_size is not None else 0,
+            'output_size': int(output_size) if output_size is not None else 0,
             'op_counts': op_counts,
             'layer_sizes': layer_sizes
         }

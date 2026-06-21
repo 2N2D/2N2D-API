@@ -433,38 +433,7 @@ def analyze_onnx_model_universal(model_bytes):
                 os.remove(tempFilePath)
             except:
                 pass
-        return {
-            'input_size': 64,
-            'output_size': 1,
-            'num_layers': 2,
-            'max_width': 128,
-            'layer_sizes': [128, 64],
-            'has_lstm': False,
-            'has_gru': False,
-            'has_rnn': False,
-            'has_conv': False,
-            'has_conv1d': False,
-            'has_conv2d': False,
-            'has_attention': False,
-            'has_normalization': False,
-            'activation_type': 'relu',
-            'lstm_hidden_size': 64,
-            'lstm_layers': 1,
-            'post_lstm_layers': 0,
-            'conv_channels': [],
-            'conv_details': [],
-            'pooling_details': [],
-            'structural_ops': [],
-            'activation_ops': [],
-            'has_pooling': False,
-            'op_counts': {},
-            'op_sequence': [],
-            'model_type': 'feedforward',
-            'hidden_size': 128,
-            'is_recurrent': False,
-            'layers': 1,
-            'neurons': 64
-        }
+        return {"error": f"Failed to analyze ONNX model universally: {str(e)}"}
 
 def analyze_onnx_model(model_bytes):
     return analyze_onnx_model_universal(model_bytes)
@@ -681,27 +650,11 @@ def process_uploaded_model(file_bytes, filename):
             in_size = arch_info.get("input_size", 10)
             if in_size <= 0: in_size = 10
             
-            if arch_info.get("has_conv2d"):
-                dummy_input = torch.randn(1, arch_info.get("input_channels", 1), 28, 28)
-            elif arch_info.get("has_conv1d"):
-                dummy_input = torch.randn(1, arch_info.get("input_channels", 1), in_size)
-            elif arch_info.get("has_lstm") or arch_info.get("has_gru") or arch_info.get("has_rnn"):
-                dummy_input = torch.randn(1, 10, in_size)
-            else:
-                dummy_input = torch.randn(1, in_size)
-                
-            temp_out = os.path.join(tempfile.gettempdir(), f"exported_{uuid.uuid4().hex}.onnx")
-            
-            model.eval()
-            try:
-                torch.onnx.export(model, dummy_input, temp_out, export_params=True, opset_version=12)
-                with open(temp_out, "rb") as f:
-                    onnx_bytes = f.read()
-                os.remove(temp_out)
-                return load_onnx_model(onnx_bytes)
-            except Exception as e:
-                logging.exception("Failed to export PyTorch model to ONNX for visualization")
-                return {"error": f"Failed to export PyTorch to ONNX: {str(e)}"}
+            # Since we cannot know the exact input shape (sequence length, image width/height) 
+            # for an arbitrary untraced PyTorch model, we will return an error instructing 
+            # the user to either provide an ONNX format for visualization or use the .pt2 format 
+            # directly in the optimization pipeline.
+            return {"error": "PyTorch visualization requires an explicit input shape. Please upload an ONNX model for architecture visualization, or proceed directly to Optimization with your .pt2 model."}
                 
         except Exception as e:
             logging.exception("Failed to process PyTorch model")
@@ -726,7 +679,6 @@ def find_optimal_architecture(onnx_bytes, input_features, target_feature, df: pd
         
         device = get_device()
         
-        
         torch.set_num_threads(4)  
         
         if df is None:
@@ -741,19 +693,74 @@ def find_optimal_architecture(onnx_bytes, input_features, target_feature, df: pd
         
         if is_pytorch:
             temp_in = createTempFile(onnx_bytes, ".pt")
-            model = torch.load(temp_in, map_location="cpu", weights_only=False)
-            os.remove(temp_in)
             
             try:
-                # Replace dict-builder with native torch.fx trace
-                traced_model = fx.symbolic_trace(model)
-            except Exception as e:
-                logging.error(f"Could not symbolically trace uploaded model: {e}")
-                return {"error": "Uploaded PyTorch model contains dynamic control flow and cannot be optimized."}
-
-            model_info = FXMutator().extract_fx_blueprint(traced_model)
-            # Store native fx model
-            model_info['_native_fx_model'] = traced_model
+                # 1. Attempt loading as an ExportedProgram (.pt2 from torch.export.save)
+                import torch.export as torch_export
+                exported_program = torch_export.load(temp_in)
+                traced_model = exported_program.module()
+                model_info = FXMutator().extract_fx_blueprint(traced_model)
+                model_info['_native_fx_model'] = traced_model
+                
+                # add this — fills in the 0/0 that extract_fx_blueprint misses
+                shape_info = analyze_pytorch_model(traced_model)
+                model_info['input_size']  = shape_info['input_size']
+                model_info['output_size'] = shape_info['output_size']
+                model_info['layers']      = shape_info['layers']
+                model_info['neurons']     = shape_info['neurons']
+                model_info['max_width']   = shape_info['max_width']
+                
+                # For ExportedPrograms (.pt2), original class types like nn.Linear are lost. 
+                # We dynamically extract shapes from the raw ATen graph nodes instead.
+                try:
+                    user_inputs = [spec.arg.name for spec in exported_program.graph_signature.input_specs if spec.kind.name == 'USER_INPUT']
+                    if user_inputs:
+                        in_n = [n for n in exported_program.graph.nodes if n.name in user_inputs][0]
+                        model_info['input_size'] = in_n.meta['val'].shape[-1]
+                    
+                    out_n = [n for n in exported_program.graph.nodes if n.op == 'output'][0]
+                    
+                    # Look at the first element in output tuple
+                    out_val = out_n.args[0][0]
+                    if hasattr(out_val, 'meta') and 'val' in out_val.meta:
+                        model_info['output_size'] = out_val.meta['val'].shape[-1]
+                    
+                    valid_shapes = [n.meta['val'].shape[-1] for n in exported_program.graph.nodes if 'val' in n.meta and hasattr(n.meta['val'], 'shape') and len(n.meta['val'].shape) > 1]
+                    if valid_shapes:
+                        model_info['max_width'] = max(valid_shapes)
+                        model_info['neurons'] = max(valid_shapes)
+                        
+                    linear_ops = [n for n in exported_program.graph.nodes if n.op == 'call_function' and ('linear' in str(n.target) or 'addmm' in str(n.target))]
+                    if linear_ops:
+                        model_info['layers'] = len(linear_ops)
+                except Exception as e:
+                    logging.warning(f"Could not extract robust shape from exported_program nodes: {e}")
+                
+                logging.info("Successfully loaded PyTorch model as an ExportedProgram (FX GraphModule).")
+            except Exception as export_load_e:
+                try:
+                    # 2. Fallback to legacy torch.load (requires class definition in scope)
+                    model = torch.load(temp_in, map_location="cpu", weights_only=False)
+                    
+                    from torch.fx import Tracer, GraphModule
+                    class CustomTracer(Tracer):
+                        def is_leaf_module(self, m: torch.nn.Module, module_qualified_name: str) -> bool:
+                            if isinstance(m, (torch.nn.LSTM, torch.nn.GRU, torch.nn.RNN)):
+                                return True
+                            return super().is_leaf_module(m, module_qualified_name)
+                    
+                    tracer = CustomTracer()
+                    graph = tracer.trace(model)
+                    traced_model = GraphModule(tracer.root, graph, 'm')
+                    model_info = FXMutator().extract_fx_blueprint(traced_model)
+                    model_info['_native_fx_model'] = traced_model
+                    logging.info("Successfully loaded and traced PyTorch model using legacy torch.load().")
+                except Exception as e:
+                    import traceback
+                    logging.error(f"Could not symbolically trace uploaded model: {e}\n{traceback.format_exc()}")
+                    return {"error": f"Uploaded PyTorch model failed to load/trace natively. Please make sure the model is exportable via FX or use PyTorch 2.0+ torch.export.save() format (.pt2). Error: {str(e)}"}
+            finally:
+                os.remove(temp_in)
         else:
             model_info = analyze_onnx_model(onnx_bytes)
             
@@ -833,8 +840,26 @@ def find_optimal_architecture(onnx_bytes, input_features, target_feature, df: pd
         if is_pytorch and '_native_fx_model' in model_info:
             baseline_model = copy.deepcopy(model_info['_native_fx_model'])
             baseline_model = baseline_model.to(device)
+            
+            # Map any hardcoded devices inside the FX graph math to the active device (GPU)
+            try:
+                modified_graph = False
+                for node in baseline_model.graph.nodes:
+                    if 'device' in node.kwargs:
+                        new_kwargs = dict(node.kwargs)
+                        new_kwargs['device'] = device
+                        node.kwargs = new_kwargs
+                        modified_graph = True
+                if modified_graph:
+                    baseline_model.graph.lint()
+                    baseline_model.recompile()
+                    # Also update our base blueprint memory so downstream iterations (Optuna / Genetics) clone the GPU-graph!
+                    model_info['_native_fx_model'] = copy.deepcopy(baseline_model)
+            except Exception as e:
+                logging.warning(f"Failed to systematically rewrite FX graph devices to {device}: {e}")
+                
         else:
-            raise ValueError("Only PyTorch models (.pt, .pth) are currently supported for architecture optimization.")
+            raise ValueError("Only PyTorch models (.pt, .pth, .pt2) are currently supported for architecture optimization.")
 
         criterion = nn.MSELoss()
         optimizer = optim.Adam(baseline_model.parameters(), lr=0.001)
@@ -1030,7 +1055,7 @@ def find_optimal_architecture(onnx_bytes, input_features, target_feature, df: pd
             optuna.logging.set_verbosity(optuna.logging.WARNING)
             study = optuna.create_study(direction="maximize")
             
-            n_trials = 9
+            n_trials = max(1, generations)
             for i in range(n_trials):
                 trial = study.ask()
                 r2_val = objective(trial)

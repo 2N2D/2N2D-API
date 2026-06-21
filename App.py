@@ -143,7 +143,7 @@ async def optimize(
     })
     onnx_binary = await getFileBinaryData(onnx_path)
     
-    is_pytorch_model = onnx_path.endswith(".pt") or onnx_path.endswith(".pth")
+    is_pytorch_model = onnx_path.endswith(".pt") or onnx_path.endswith(".pth") or onnx_path.endswith(".pt2")
 
     def status_callback(message):
         message_queues[session_id].append(message)
