@@ -35,6 +35,9 @@ class NodeRegistry:
             else:
                 kwargs[param_key] = param_value
 
+        if node_type in ("Softmax", "LogSoftmax") and "dim" not in kwargs:
+            kwargs["dim"] = -1
+
         return module_cls(**kwargs)
 
     @classmethod
@@ -60,10 +63,32 @@ class NodeRegistry:
         cls.register("Tanh", nn.Tanh, {})
         cls.register("Sigmoid", nn.Sigmoid, {})
         cls.register("Softmax", nn.Softmax, {})
+        cls.register("LogSoftmax", nn.LogSoftmax, {})
         cls.register("Dropout", nn.Dropout, {"p": "p"})
         cls.register("Flatten", nn.Flatten, {"start_dim": "start_dim", "end_dim": "end_dim"})
         cls.register("BatchNorm1d", nn.BatchNorm1d, {"num_features": "num_features"})
         cls.register("BatchNorm2d", nn.BatchNorm2d, {"num_features": "num_features"})
+
+        class SelfAttention(nn.Module):
+            def __init__(self, embed_dim: int, num_heads: int, batch_first: bool = True, **kwargs):
+                super().__init__()
+                self.attention = nn.MultiheadAttention(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    batch_first=batch_first,
+                    **kwargs,
+                )
+
+            def forward(self, x):
+                output, _ = self.attention(x, x, x, need_weights=False)
+                return output
+
+        cls.register(
+            "MultiheadAttention",
+            SelfAttention,
+            {"embed_dim": "embed_dim", "num_heads": "num_heads", "batch_first": "batch_first"},
+            execution_op="self_attention",
+        )
 
 # Initialize defaults
 NodeRegistry._register_defaults()

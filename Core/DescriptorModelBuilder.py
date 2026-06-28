@@ -56,27 +56,40 @@ class DynamicGraphModule(nn.Module):
         
         return sorted_order
 
+    def _downstream_expects_sequence(self, node_id: str) -> bool:
+        sequence_nodes = {"LSTM", "GRU", "RNN", "MultiheadAttention"}
+        downstream_ids = [edge.target for edge in self.descriptor.edges if edge.source == node_id]
+        for downstream_id in downstream_ids:
+            downstream_node = next((n for n in self.descriptor.nodes if n.id == downstream_id), None)
+            if downstream_node and downstream_node.type in sequence_nodes:
+                return True
+        return False
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Tensors flowing through edges
         outputs = {"input": x}
         hidden_states = {}
 
-        # Edges track which outputs go where. For simplicity, assume nodes are single input/output 
-        # unless handling complex merges
-        
-        # A more robust implementation resolves merge rules here
         for node_id in self.sorted_nodes:
-            # Find inputs to this node
+            # Collect inputs to this node; skip edges whose source hasn't been computed yet
+            # (can happen with dangling skip connections or malformed descriptors)
             node_inputs = []
             for edge in self.descriptor.edges:
                 if edge.target == node_id:
-                    node_inputs.append(outputs[edge.source])
-            
+                    if edge.source in outputs:
+                        node_inputs.append(outputs[edge.source])
+
             if not node_inputs:
                 continue
 
-            # Standard case: single input
-            in_tensor = node_inputs[0] if len(node_inputs) == 1 else torch.cat(node_inputs, dim=-1)
+            # Merge rule: concat along last dim when multiple inputs arrive
+            merge_rule = self.descriptor.merge_rules.get(node_id, "concat")
+            if len(node_inputs) == 1:
+                in_tensor = node_inputs[0]
+            elif merge_rule == "add":
+                in_tensor = torch.stack(node_inputs).sum(dim=0)
+            else:  # default: concat on feature dim
+                in_tensor = torch.cat(node_inputs, dim=-1)
 
             # Node execution
             node_def = next((n for n in self.descriptor.nodes if n.id == node_id), None)
@@ -84,35 +97,41 @@ class DynamicGraphModule(nn.Module):
                 continue
 
             execution_op = NodeRegistry.get_execution_semantic(node_def.type)
-            
+
             if node_id in self.node_modules:
                 mod = self.node_modules[node_id]
-                
+
                 if execution_op == "recurrent_lstm":
-                    # Manage LSTM state if needed (stateless in standard forward)
                     out, hidden = mod(in_tensor)
-                    outputs[node_id] = out
                     hidden_states[node_id] = hidden
+                    if out.dim() == 3 and not self._downstream_expects_sequence(node_id):
+                        outputs[node_id] = out[:, -1, :]
+                    else:
+                        outputs[node_id] = out
                 elif execution_op == "recurrent_gru":
                     out, hidden = mod(in_tensor)
-                    outputs[node_id] = out
                     hidden_states[node_id] = hidden
+                    if out.dim() == 3 and not self._downstream_expects_sequence(node_id):
+                        outputs[node_id] = out[:, -1, :]
+                    else:
+                        outputs[node_id] = out
                 else:
                     outputs[node_id] = mod(in_tensor)
             else:
-                # Virtual nodes (e.g. merge/reshape)
-                # Need explicit handling here 
+                # Virtual nodes (e.g. merge/reshape) — pass through
                 outputs[node_id] = in_tensor
 
-        # Find final output
+        # Find final output — guard against nodes that weren't reached (e.g. excluded by cycle)
         final_output_sources = [e.source for e in self.descriptor.edges if e.target == "output"]
-        if final_output_sources:
-            return outputs[final_output_sources[0]]
-        
-        # Fallback to last node if edge output is missing
-        if self.sorted_nodes:
-            return outputs[self.sorted_nodes[-1]]
-            
+        for src in final_output_sources:
+            if src in outputs:
+                return outputs[src]
+
+        # Fallback: return last successfully computed node output
+        for node_id in reversed(self.sorted_nodes):
+            if node_id in outputs:
+                return outputs[node_id]
+
         return x
 
 class DescriptorModelBuilder:
